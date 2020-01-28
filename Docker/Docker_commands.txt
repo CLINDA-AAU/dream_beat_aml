@@ -1,0 +1,9 @@
+# syntax: docker build -t docker.synapse.org/<Your project ID>/<Repo name>:<Tag> <Dockerfile path>
+# Use tags to specify sc1 or sc2 and model version
+docker build -t  docker.synapse.org/syn21516946/aauh_beat_aml:sc1_model1 .
+
+# Login
+docker login docker.synapse.org
+
+# Push image
+docker push docker.synapse.org/syn21516946/aauh_beat_aml:sc1_model1

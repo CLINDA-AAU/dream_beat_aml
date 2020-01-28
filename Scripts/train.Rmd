@@ -1,0 +1,359 @@
+---
+title: "Beat AML"
+author: "RFB"
+date: "9/1/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(gplots)
+library(reshape2)
+library(ggplot2)
+library(glmnet)
+library(survival)
+library(survminer)
+library(matrixStats)
+library(plyr)
+library(mice)
+```
+
+### Load Clinical and response data
+```{r}
+aucs        <- read.csv("../ExternalData/aucs.csv", stringsAsFactors = F)
+response    <- read.csv("../ExternalData/response.csv", stringsAsFactors = F, row.names = 1)
+clin_cat    <- read.csv("../ExternalData/clinical_categorical.csv", stringsAsFactors = F, row.names = 1, check.names = F)
+clin_num    <- read.csv("../ExternalData/clinical_numerical.csv", stringsAsFactors = F, row.names = 1)
+clin_legend <- read.csv("../ExternalData/clinical_categorical_legend.csv", stringsAsFactors = F)
+```
+
+Perform median imputation in numerical clinical data
+```{r}
+medImp <- function(x){
+  missing <- which(is.na(x))
+  x[missing] <- median(x[-missing])
+  return(x)
+}
+
+rn <- row.names(clin_num)
+clin_num <- sapply(clin_num, medImp)
+row.names(clin_num) <- rn
+```
+
+Recode categorical clinical data and build design matrix
+```{r}
+for(feat in names(clin_cat)){
+  clin_cat[[feat]] <- factor(mapvalues(clin_cat[[feat]],
+                                        from = clin_legend$enum[clin_legend$column==feat],
+                                          to = clin_legend$value[clin_legend$column==feat]))
+}
+
+clin_cat_model <- model.matrix(rep(1,nrow(clin_cat)) ~ ., data = clin_cat)
+```
+
+### Load omics data
+```{r}
+#rna <- read.csv("../ExternalData/rnaseq.csv", check.names = F, stringsAsFactors = F)
+dna <- read.csv("../ExternalData/dnaseq.csv", stringsAsFactors = F)
+```
+
+Shape DNA data to make it square. DNA data has been prefiltered to only include high confidence somatic variants, meaning no variants are retained for some individuals. For these individuals we specify dna data as no variants detected, i.e. a value of zero for all variables.
+```{r}
+## Reshape to wide with 0/1 values for variation within gene
+dnaWide <- dcast(dna, lab_id ~ Hugo_Symbol,
+                 value.var = "Hugo_Symbol",
+                 fun.aggregate = function(x) as.numeric(length(x)>0)
+)
+#dnaWide <- dcast(dna, lab_id ~ Hugo_Symbol) # More than one variant in some gene/lab_id combos
+row.names(dnaWide) <- dnaWide$lab_id
+dnaWide <- dnaWide[,-1] 
+
+## Not all ids have mutation data - "impute" as none
+missIDs <- row.names(clin_num)[!row.names(clin_num) %in% row.names(dnaWide)]
+missDNAwide <- matrix(nrow = length(missIDs), ncol = ncol(dnaWide), 0)
+row.names(missDNAwide) <- missIDs
+colnames(missDNAwide)  <- colnames(dnaWide)
+
+## Combine
+dnaWide <- rbind(dnaWide, missDNAwide)
+dnaWide <- dnaWide[order(row.names(dnaWide)),]
+```
+
+
+## Descriptive statistics
+Plot survival
+```{r}
+survfit <- survfit(with(response, Surv(overallSurvival, vitalStatus == "Dead")~1))
+ggsurvplot(survfit,
+           data = response)
+```
+
+Heatmap of AUCs
+```{r, fig.height = 10}
+ggplot(aucs, aes(x = lab_id, y = inhibitor, fill = auc)) + geom_tile()
+```
+
+```{r, eval=F}
+aucs_wide <- dcast(aucs, lab_id~inhibitor, value.var = "auc")
+# Try with heatmap2
+heatmap.2(t(as.matrix(aucs2[,-1])),
+          dendrogram = "none",
+          trace = "none",
+          key = F)
+```
+
+
+Plot correlation of AUCs
+```{r, fig.height=10}
+aucs_wide <- dcast(aucs, lab_id~inhibitor, value.var = "auc")
+auc_cor <- cor(aucs_wide[,-1], use = "pairwise.complete.obs")
+heatmap.2(auc_cor,
+          dendrogram = "both",
+          trace = "none",
+          key = T)
+```
+
+Summary of RNA-seq. Values are given as log2(cpm)
+```{r, eval = F}
+rnaSD   <- apply(as.matrix(rna[,-c(1,2)]),1,sd)
+rnaMean <- apply(as.matrix(rna[,-c(1,2)]),1,mean)
+rnaCV   <- rnaSD / rnaMean
+
+plot(rnaMean, rnaSD)
+```
+
+DNA-seq
+```{r, fig.height=10}
+ggplot(dna, aes(x = lab_id, y = Hugo_Symbol)) + geom_tile()
+```
+```{r}
+sort(table(dna$Hugo_Symbol), decreasing = T)
+```
+
+## SC1
+Build X matrix
+```{r}
+source("aux_functions.R")
+X <- buildX("../ExternalData/")
+```
+
+
+Fit model for drug response for each drug
+```{r}
+if(!file.exists("../GeneratedData/dose_response_model.RData")){
+  dose_response_models <- list()
+  for(drug in unique(aucs$inhibitor)){
+    ## Select data for model training
+    aucY <- subset(aucs, inhibitor == drug)
+    ids  <- aucY$lab_id
+    
+    ## Build feature matrix for ids with dose-response auc values
+    aucX <- as.matrix(X[ids,])
+    
+    ## Filter zero variance features
+    aucX <- aucX[, colSds(aucX) > 0]
+    
+    ## Store results in list
+    fit <- cv.glmnet(x = aucX,
+                     y = aucY$auc)
+    
+    dose_response_models[[drug]] <- fit
+  }
+  save(dose_response_models, file = "../GeneratedData/dose_response_model.RData")
+} else{
+  load("../GeneratedData/dose_response_model.RData")
+}
+```
+
+Extract results
+```{r}
+getTop <- function(x){
+  COEF <- as.matrix(coef(x, s = x$lambda.min))
+  nzero.coef <- COEF[COEF != 0, ]
+  data.frame("coef" = nzero.coef[order(abs(nzero.coef), decreasing = T)])
+}
+
+resSum <- function(x){
+  x$cvm[x$lambda.min]
+}
+
+dose_response_models_MSE <- (unlist(lapply(dose_response_models, resSum)))
+plot(dose_response_models_MSE, ylab = "MSE", main = "MSE for cv.glmnet")
+```
+
+Predict data
+```{r}
+pred_fit <- list()
+for(drug in unique(aucs$inhibitor)){
+  fit <- dose_response_models[[drug]]
+  pred_fit[[drug]] <- predict(fit, 
+                              newx = as.matrix(X[,row.names(coef(fit))[-1]]), 
+                              s = "lambda.min")
+}
+```
+
+Calculate and plot results in training data
+```{r}
+train_cor <- c()
+for(drug in unique(aucs$inhibitor)){
+  temp <- merge(data.frame(pred_fit[[drug]]), 
+                subset(aucs, inhibitor == drug),
+                by.x = 0, by.y = "lab_id")
+  train_cor[drug] <- cor(temp$X1, temp$auc, method = "spearman")
+}
+
+plot(train_cor, main = "Correlation of true vs pred in training", ylab = "Cor")
+abline(h = mean(train_cor, na.rm = T), col = "red")
+```
+
+### Multi response model
+```{r}
+if(!file.exists("../GeneratedData/dose_response_model_mv.RData")){
+  ## Impute missing response data
+  aucs_wide_notNA <- mice(data.frame(aucs_wide[,-1]), meth = "cart", minbucket = 4, m = 1)
+  y <- complete(aucs_wide_notNA)
+  colnames(y) <- colnames(aucs_wide[,-1])
+  
+  ## Fit glmnet
+  fit_mv <- cv.glmnet(x = as.matrix(X),
+                      y = as.matrix(y),
+                      family = "mgaussian")
+  
+  save(fit_mv, file = "../GeneratedData/dose_response_model_mv.RData")
+} else{
+  load("../GeneratedData/dose_response_model_mv.RData")
+}
+```
+
+Predict from model
+```{r}
+pred_fit_mv <- predict(fit_mv,
+                       newx = as.matrix(X),
+                       s = "lambda.min")
+
+pred_fit_mv_long <- melt(pred_fit_mv[,,1])
+names(pred_fit_mv_long) <- c("lab_id", "inhibitor", "auc")
+```
+
+Calculate and plot results in training data
+```{r}
+train_cor_mv <- c()
+for(drug in unique(aucs$inhibitor)){
+  train_cor_mv[drug] <- cor(aucs_wide[,drug], pred_fit_mv[,drug,1], method = "spearman", use = "pairwise.complete.obs")
+}
+
+plot(train_cor_mv, main = "Correlation of true vs pred in training (mv model)", ylab = "Cor")
+abline(h = mean(train_cor_mv, na.rm = T), col = "red")
+```
+
+Compare uni vs multi model
+```{r}
+plotData <- data.frame("uni" = train_cor[order(names(train_cor))],
+                       "multi" = train_cor_mv[order(names(train_cor_mv))],
+                       "av_cor" = colMeans(auc_cor, na.rm = T),
+                       "pct_miss" = colSums(is.na(aucs_wide[,-1]))/nrow(aucs_wide))
+plotData$uni[is.na(plotData$uni)] <- 0
+
+ggplot(plotData, aes(x = uni, y = multi, col = av_cor)) +
+  geom_point() +
+  scale_color_viridis_c()
+
+ggplot(plotData, aes(x = uni, y = multi, col = pct_miss)) +
+  geom_point() +
+  scale_color_viridis_c()
+
+ggplot(plotData, aes(x =1:nrow(plotData) , y = (multi-uni), col = av_cor)) +
+  geom_point() +
+  scale_color_viridis_c()
+```
+
+```{r}
+mean(plotData$multi - plotData$uni, na.rm = T)
+```
+
+
+```{r}
+selectMV <- row.names(plotData[which(plotData$multi - plotData$uni > 0),])
+save(selectMV, file = "../GeneratedData/select_mv.RData")
+```
+
+
+### Caret
+```{r}
+library(caret)
+library(doParallel)
+
+registerDoParallel(3)
+#registerDoRNG(seed = 123)
+#getDoParWorkers()
+  
+## Setup train object
+fitControl <- trainControl(
+  method  = "cv",
+  number  = 10,
+  allowParallel = TRUE)
+
+
+aucY <- subset(aucs, inhibitor == "Imatinib")
+ids  <- aucY$lab_id
+
+## Build feature matrix for ids with dose-response auc values
+aucX <- as.matrix(X[ids,])
+
+## Filter zero variance features
+aucX <- aucX[, colSds(aucX) > 0]
+
+set.seed(825)
+system.time(
+## Tune model
+  
+  gbmFit1 <- train(x = aucX,
+                   y = aucY$auc,
+                   method = "rf", 
+                   trControl = fitControl,
+                   verbose = FALSE,
+                   metric = "Rsquared")
+)
+## Print Results
+gbmFit1
+
+```
+
+```{r, eval = F}
+## Multiple models
+model_list <- caretList(X_train,
+                        y_train,
+                        trControl = fitcontrol,
+                        methodList = c("lm", "svmRadial", "rf", 
+                                       "xgbTree", "xgbLinear"),
+                        tuneList = NULL,
+                        continue_on_fail = FALSE, 
+                        preProcess = c("center","scale"))
+```
+
+
+### Neuralnet
+```{r}
+library(neuralnet)
+neuralnet(formula = aucY~aucX)
+```
+
+
+## SC2
+Create training data
+```{r}
+response$OS <- Surv(response$overallSurvival, response$vitalStatus == "Dead")
+os_train    <- merge(response, clin_num, by = 0)
+```
+
+Train cox Model
+```{r}
+os_fit <- coxph(OS ~ ageAtDiagnosis + WBC.Count, data = os_train)
+summary(os_fit)
+```
+
+Save model
+```{r}
+save(os_fit, file = "../GeneratedData/os_model.RData")
+```
+
