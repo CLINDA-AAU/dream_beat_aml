@@ -1,0 +1,80 @@
+---
+title: "Train GLMNET"
+author: "RFB"
+date: "28 1 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(glmnet)
+library(glmnetUtils)
+library(mice)
+library(reshape2)
+library(parallel)
+library(foreach)
+library(doParallel)
+```
+
+Build X matrix
+```{r}
+source("aux_functions.R")
+X <- buildX("../ExternalData/")
+```
+
+Load AUC data, reshape and impute missing
+```{r}
+aucs <- read.csv("../ExternalData/aucs.csv", stringsAsFactors = F)
+aucs_wide <- dcast(aucs, lab_id~inhibitor, value.var = "auc")
+aucs_wide_notNA <- mice(data.frame(aucs_wide[,-1]), meth = "cart", m = 1)
+y <- complete(aucs_wide_notNA)
+colnames(y) <- colnames(aucs_wide[,-1])
+```
+
+## Multivariate model
+```{r}
+if(!file.exists("../GeneratedData/dose_response_model_mv_en.RData")){
+  cl <- makeForkCluster(10)
+  
+  ## Fit glmnet
+  fit_mv <- cva.glmnet(x = as.matrix(X),
+                       y = as.matrix(y),
+                       family = "mgaussian",
+                       #outerParallel = cl,
+                       parallel = T)
+  
+  stopCluster(cl)
+  
+  bestFit <- which.min(sapply(fit_mv$modlist, function(x) min(x$cvm)))
+  dose_response_model <- fit_mv$modlist[[bestFit]]
+  save(dose_response_model, file = "../GeneratedData/dose_response_model_mv_en.RData")
+} else{
+  load("../GeneratedData/dose_response_model_mv_en.RData")
+}
+```
+
+## Single variate models
+```{r}
+if(!file.exists("../GeneratedData/dose_response_model_en.RData")){
+  # Set up parallel computations
+  registerDoParallel(cores = 10)
+  fit <- foreach(i=1:ncol(y),
+                 .errorhandling = "pass",
+                 .packages = c("glmnetUtils")) %dopar% {
+                   cva.glmnet(x = as.matrix(X),
+                              y = as.matrix(y[,i]),
+                              family = "gaussian",
+                              parallel = T)
+                 }
+  findMin <- function(x){
+    a <- which.min(sapply(x$modlist, function(x) min(x$cvm)))
+    x$modlist[[a]]
+  }
+  
+  dose_response_models <- lapply(fit, findMin)
+  names(dose_response_models) <- colnames(aucs_wide)[-1]
+  save(dose_response_models, file = "../GeneratedData/dose_response_model_en.RData")
+} else{
+  load("../GeneratedData/dose_response_model_en.RData")
+}
+```
