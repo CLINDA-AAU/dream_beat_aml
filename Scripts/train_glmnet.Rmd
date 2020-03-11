@@ -33,6 +33,7 @@ colnames(y) <- colnames(aucs_wide[,-1])
 
 ## Multivariate model
 ```{r}
+### Submitted to validation
 if(!file.exists("../GeneratedData/dose_response_model_mv_en2.RData")){
   ## Fit glmnet
   cl <- makeForkCluster(5)

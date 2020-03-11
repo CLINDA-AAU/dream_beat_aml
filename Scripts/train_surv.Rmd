@@ -70,6 +70,7 @@ summary(os_fit)
 Add mutations
 ```{r}
 # syn21522225
+# Submitted to validation
 os_train_2 <- merge(os_train, clin_cat, by.x = "Row.names", by.y = 0)
 os_fit2    <- coxph(OS ~ ageAtDiagnosis + WBC.Count + `FLT3-ITD` * NPM1, data = os_train_2)
 summary(os_fit2)
