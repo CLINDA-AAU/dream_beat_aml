@@ -1,0 +1,110 @@
+---
+title: "Train Survival models"
+author: "RFB & LHJ"
+date: "11 3 2020"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(gplots)
+library(reshape2)
+library(ggplot2)
+library(glmnet)
+library(survival)
+library(survminer)
+library(matrixStats)
+library(plyr)
+library(mice)
+library(splines)
+```
+
+### Load Clinical and response data
+```{r}
+aucs        <- read.csv("../ExternalData/aucs.csv", stringsAsFactors = F)
+response    <- read.csv("../ExternalData/response.csv", stringsAsFactors = F, row.names = 1)
+clin_cat    <- read.csv("../ExternalData/clinical_categorical.csv", stringsAsFactors = F, row.names = 1, check.names = F)
+clin_num    <- read.csv("../ExternalData/clinical_numerical.csv", stringsAsFactors = F, row.names = 1)
+clin_legend <- read.csv("../ExternalData/clinical_categorical_legend.csv", stringsAsFactors = F)
+```
+
+Perform median imputation in numerical clinical data
+```{r}
+medImp <- function(x){
+  missing <- which(is.na(x))
+  x[missing] <- median(x[-missing])
+  return(x)
+}
+
+rn <- row.names(clin_num)
+clin_num <- sapply(clin_num, medImp)
+row.names(clin_num) <- rn
+```
+
+Recode categorical clinical data and build design matrix
+```{r}
+for(feat in names(clin_cat)){
+  clin_cat[[feat]] <- factor(mapvalues(clin_cat[[feat]],
+                                        from = clin_legend$enum[clin_legend$column==feat],
+                                          to = clin_legend$value[clin_legend$column==feat]))
+}
+
+clin_cat_model <- model.matrix(rep(1,nrow(clin_cat)) ~ ., data = clin_cat)
+```
+
+## SC2
+Create training data
+```{r}
+response$OS <- Surv(response$overallSurvival, response$vitalStatus == "Dead")
+os_train    <- merge(response, clin_num, by = 0)
+```
+
+Train cox Model
+```{r}
+#	syn21522225
+os_fit <- coxph(OS ~ ageAtDiagnosis + WBC.Count, data = os_train)
+summary(os_fit)
+```
+
+Add mutations
+```{r}
+# syn21522225
+os_train_2 <- merge(os_train, clin_cat, by.x = "Row.names", by.y = 0)
+os_fit2    <- coxph(OS ~ ageAtDiagnosis + WBC.Count + `FLT3-ITD` * NPM1, data = os_train_2)
+summary(os_fit2)
+```
+
+Save model
+```{r}
+save(os_fit2, file = "../GeneratedData/os_model2.RData")
+```
+
+Train cox model with splines
+```{r}
+# syn21522225
+os_fit_spline <- coxph(OS ~ ns(ageAtDiagnosis, df = 3) + ns(WBC.Count, df =  3), data = os_train)
+summary(os_fit_spline)
+```
+
+Save model
+```{r}
+save(os_fit_spline, file = "../GeneratedData/os_model_spline.RData")
+load("../GeneratedData/os_model_spline.RData")
+```
+
+Try model with pseudo values
+```{r}
+library(pseudo)
+pseudo.calc <- pseudomean(time = response$overallSurvival, 
+                          event = as.numeric(response$vitalStatus == "Dead"), tmax = 500)
+os_train$pseudo <- pseudo.calc
+
+fit <- glm(pseudo ~ ageAtDiagnosis + WBC.Count, data = os_train)
+summary(fit)
+
+```
+Save model
+```{r}
+save(fit, file = "../GeneratedData/rms_model.RData")
+```

@@ -33,23 +33,23 @@ colnames(y) <- colnames(aucs_wide[,-1])
 
 ## Multivariate model
 ```{r}
-if(!file.exists("../GeneratedData/dose_response_model_mv_en.RData")){
-  cl <- makeForkCluster(10)
-  
+if(!file.exists("../GeneratedData/dose_response_model_mv_en2.RData")){
   ## Fit glmnet
-  fit_mv <- cva.glmnet(x = as.matrix(X),
+  cl <- makeForkCluster(5)
+  
+  fit_mv2 <- cva.glmnet(x = as.matrix(X),
                        y = as.matrix(y),
                        family = "mgaussian",
-                       #outerParallel = cl,
-                       parallel = T)
-  
-  stopCluster(cl)
+                       outerParallel = cl,
+                       #parallel = T,
+                       alpha = seq(0.5,0.95, by = 0.05))
+  stopCluster()
   
   bestFit <- which.min(sapply(fit_mv$modlist, function(x) min(x$cvm)))
   dose_response_model <- fit_mv$modlist[[bestFit]]
-  save(dose_response_model, file = "../GeneratedData/dose_response_model_mv_en.RData")
+  save(dose_response_model, file = "../GeneratedData/dose_response_model_mv_en2.RData")
 } else{
-  load("../GeneratedData/dose_response_model_mv_en.RData")
+  load("../GeneratedData/dose_response_model_mv_en2.RData")
 }
 ```
 
@@ -57,7 +57,7 @@ if(!file.exists("../GeneratedData/dose_response_model_mv_en.RData")){
 ```{r}
 if(!file.exists("../GeneratedData/dose_response_model_en.RData")){
   # Set up parallel computations
-  registerDoParallel(cores = 10)
+  registerDoParallel(cores = 5)
   fit <- foreach(i=1:ncol(y),
                  .errorhandling = "pass",
                  .packages = c("glmnetUtils")) %dopar% {
