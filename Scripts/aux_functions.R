@@ -1,6 +1,6 @@
-library(plyr)
-library(reshape2)
-library(glmnet)
+#library(plyr)
+#library(reshape2)
+#library(glmnet)
 
 # Function to perform median imputation
 medImp <- function(x){
@@ -11,14 +11,14 @@ medImp <- function(x){
 
 # Function to build X matrix for training or prediction
 buildX <- function(input_dir){
-  clin_num_cols <- c(1,3,4)
-  
-  clin_cat    <- read.csv(file.path(input_dir,"clinical_categorical.csv"), stringsAsFactors = F, row.names = 1, check.names = F)
-  clin_num    <- read.csv(file.path(input_dir,"clinical_numerical.csv"), stringsAsFactors = F, row.names = 1)
-  clin_legend <- read.csv(file.path(input_dir,"clinical_categorical_legend.csv"), stringsAsFactors = F)
-  rna <- read.csv(file.path(input_dir,"rnaseq.csv"), check.names = F, stringsAsFactors = F)
-  dna <- read.csv(file.path(input_dir,"dnaseq.csv"), stringsAsFactors = F)
-  
+    clin_num_cols <- c(1,3,4)
+    
+    clin_cat    <- read.csv(file.path(input_dir,"clinical_categorical.csv"), stringsAsFactors = F, row.names = 1, check.names = F)
+    clin_num    <- read.csv(file.path(input_dir,"clinical_numerical.csv"), stringsAsFactors = F, row.names = 1)
+    clin_legend <- read.csv(file.path(input_dir,"clinical_categorical_legend.csv"), stringsAsFactors = F)
+    rna <- read.csv(file.path(input_dir,"rnaseq.csv"), check.names = F, stringsAsFactors = F)
+    dna <- read.csv(file.path(input_dir,"dnaseq.csv"), stringsAsFactors = F)
+    
   
   #####################
   ### Clinical data ###

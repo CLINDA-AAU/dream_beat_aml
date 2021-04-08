@@ -1,0 +1,253 @@
+---
+title: "Train GLMNET"
+author: "RFB"
+date: "28 1 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(glmnet)
+library(glmnetUtils)
+library(mice)
+library(reshape2)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(ggplot2)
+library(plyr)
+library(tidyverse)
+library(matrixStats)
+
+#setwd("~/Rprojects/dream_beat_aml/Scripts/")
+```
+
+Build X matrix
+```{r}
+source("aux_functions.R")
+X <- buildX("../ExternalData/")
+```
+
+Load AUC data, reshape and impute missing
+```{r}
+aucs <- read.csv("../ExternalData/aucs.csv", stringsAsFactors = F)
+aucs_wide <- dcast(aucs, lab_id~inhibitor, value.var = "auc")
+aucs_wide_notNA <- mice(data.frame(aucs_wide[,-1]), meth = "cart", m = 1)
+y <- complete(aucs_wide_notNA)
+colnames(y) <- colnames(aucs_wide[,-1])
+```
+
+## Multivariate model
+```{r}
+### Submitted to validation
+if(!file.exists("../GeneratedData/dose_response_model_mv_en.RData")){
+  ## Fit glmnet
+  cl <- makeForkCluster(5)
+  
+  fit_mv <- cva.glmnet(x = as.matrix(X),
+                       y = as.matrix(y),
+                       family = "mgaussian",
+                       outerParallel = cl,
+                       #parallel = T,
+                       alpha = seq(0.5,0.95, by = 0.05))
+  stopCluster()
+  
+  bestFit <- which.min(sapply(fit_mv$modlist, function(x) min(x$cvm)))
+  dose_response_model <- fit_mv$modlist[[bestFit]]
+  save(dose_response_model, file = "../GeneratedData/dose_response_model_mv_en.RData")
+} else{
+  load("../GeneratedData/dose_response_model_mv_en.RData")
+}
+```
+
+## Single variate models
+```{r}
+if(!file.exists("../GeneratedData/dose_response_model_en.RData")){
+  # Set up parallel computations
+  registerDoParallel(cores = 5)
+  fit <- foreach(i=1:ncol(y),
+                 .errorhandling = "pass",
+                 .packages = c("glmnetUtils")) %dopar% {
+                   cva.glmnet(x = as.matrix(X),
+                              y = as.matrix(y[,i]),
+                              family = "gaussian",
+                              parallel = T)
+                 }
+  findMin <- function(x){
+    a <- which.min(sapply(x$modlist, function(x) min(x$cvm)))
+    x$modlist[[a]]
+  }
+  
+  dose_response_models <- lapply(fit, findMin)
+  names(dose_response_models) <- colnames(aucs_wide)[-1]
+  save(dose_response_models, file = "../GeneratedData/dose_response_model_en.RData")
+} else{
+  load("../GeneratedData/dose_response_model_en.RData")
+}
+```
+
+
+# Stats for presentation
+## Univariate
+Total MSE
+```{r}
+sum(sapply(dose_response_models, function(x) x$cvm[x$lambda == x$lambda.min]))
+```
+
+
+plot figure
+```{r, fig.height=7, fig.width=8}
+plot(dose_response_models[[14]])
+title("Bortezomib (Velcade)", line = -2)
+```
+
+
+Predict data
+```{r}
+pred_fit <- list()
+for(drug in unique(aucs$inhibitor)){
+  fit <- dose_response_models[[drug]]
+  pred_fit[[drug]] <- predict(fit, 
+                              newx = as.matrix(X[,row.names(coef(fit))[-1]]), 
+                              s = "lambda.min")
+}
+```
+
+Calculate and plot results in training data
+```{r}
+train_cor <- c()
+for(drug in unique(aucs$inhibitor)){
+  temp <- merge(data.frame(pred_fit[[drug]]), 
+                subset(aucs, inhibitor == drug),
+                by.x = 0, by.y = "lab_id")
+  train_cor[drug] <- cor(temp$X1, temp$auc, method = "spearman")
+}
+
+plot(train_cor, main = "Correlation of true vs pred in training", ylab = "Cor")
+abline(h = mean(train_cor, na.rm = T), col = "red")
+```
+
+## Multivariate
+MSE
+```{r}
+dose_response_model$cvm[dose_response_model$lambda == dose_response_model$lambda.min]
+```
+
+Plot figure
+```{r, fig.height=7, fig.width=8}
+plot(dose_response_model)
+title("Multivariate model", line = -2)
+```
+
+
+Predict from model
+```{r}
+pred_fit_mv <- predict(dose_response_model,
+                       newx = as.matrix(X),
+                       s = "lambda.min")
+
+pred_fit_mv_long <- melt(pred_fit_mv[,,1])
+names(pred_fit_mv_long) <- c("lab_id", "inhibitor", "auc")
+```
+
+Calculate and plot results in training data
+```{r}
+train_cor_mv <- c()
+for(drug in unique(aucs$inhibitor)){
+  train_cor_mv[drug] <- cor(aucs_wide[,drug], pred_fit_mv[,drug,1], method = "spearman", use = "pairwise.complete.obs")
+}
+
+plot(train_cor_mv, main = "Correlation of true vs pred in training (mv model)", ylab = "Cor")
+abline(h = mean(train_cor_mv, na.rm = T), col = "red")
+```
+
+## Compare uni vs multi model
+```{r}
+auc_cor <- cor(aucs_wide[,-1], use = "pairwise.complete.obs", method = "pearson")
+auc_cor2 <- cor(aucs_wide[,-1], use = "pairwise.complete.obs", method = "spearman")
+
+
+diag(auc_cor) <- NA
+
+plotData <- data.frame("uni" = train_cor[order(names(train_cor))],
+                       "multi" = train_cor_mv[order(names(train_cor_mv))],
+                       "mean_drug_cor_pearson" = colMeans(auc_cor, na.rm = T),
+                       "median_drug_cor_pearson" = colMedians(auc_cor, na.rm = T),
+                       "mean_drug_cor_spearman" = colMeans(auc_cor2, na.rm = T),
+                       "median_drug_cor_spearman" = colMedians(auc_cor2, na.rm = T),
+                       "pct_miss" = colSums(is.na(aucs_wide[,-1]))/nrow(aucs_wide))
+plotData$uni[is.na(plotData$uni)] <- 0
+
+ggplot(plotData, aes(x = uni, y = multi, col = mean_drug_cor_pearson)) +
+  geom_point() +
+  scale_color_viridis_c()
+
+ggplot(plotData, aes(x = uni, y = multi, col = pct_miss)) +
+  geom_point() +
+  scale_color_viridis_c()
+
+mean_diff <- mean(plotData$multi - plotData$uni, na.rm = T)
+
+ggplot(plotData, aes(x =1:nrow(plotData) , y = (multi-uni), col = mean_drug_cor_pearson)) +
+  geom_point() +
+  xlab("") + 
+  ylab("Difference (multi - uni)") +
+  scale_color_viridis_c(name = "Mean correlation") +
+  geom_hline(yintercept = mean_diff) +
+  ggtitle("Difference in training data pearson correlation of Multi vs Uni")
+```
+
+
+```{r}
+plotData %>% rownames_to_column(var = "drug") %>% 
+write_csv("../GeneratedData/multi_uni_plot_data.csv")
+```
+
+
+Find drugs with high performance in multi model
+```{r}
+knitr::kable(plotData[(plotData$multi - plotData$uni) > 0.3,])
+```
+
+Check average correlation vs performance of multi model
+```{r}
+plotData %>% 
+  mutate(Multi_model = ifelse(multi > uni, "Better", "Worse")) %>% 
+  ggplot(aes(x = Multi_model, y = mean_drug_cor_pearson)) + geom_boxplot() +
+  ggpubr::stat_compare_means()
+```
+
+
+Check COEFS
+```{r}
+g <- coefficients(dose_response_model)
+drugname <- names(g)
+
+g <- do.call(cbind,g)
+g <- g[rowSums(g) != 0, ]
+g <- as.matrix(g)
+colnames(g) <- drugname
+
+write.csv(as.matrix(g), file = "../GeneratedData/dose_response_multi_coef.csv")
+```
+
+
+
+```{r}
+tail(row.names(g), n = 20)
+
+table(X[, "dxAtInclusionMYELODYSPLASTIC SYNDROMES"], X[, "dxAtSpecimenAcquisitionMYELODYSPLASTIC SYNDROMES"])
+
+plot(g["dxAtInclusionMYELODYSPLASTIC SYNDROMES", ] - g["dxAtSpecimenAcquisitionMYELODYSPLASTIC SYNDROMES", ])
+plot(g["dxAtInclusionMYELODYSPLASTIC SYNDROMES", ] + g["dxAtSpecimenAcquisitionMYELODYSPLASTIC SYNDROMES", ])
+```
+
+```{r}
+plot(g["dna_FABP2",])
+plot(g["dna_HECW2",])
+plot(g["dna_LRP8",])
+plot(g["dna_PKD1L2",])
+plot(g["dna_PLRG1",])
+plot(g["dna_TMC3",])
+```
+
